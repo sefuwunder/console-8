@@ -1,25 +1,59 @@
-// Console-8 — WebAudio engine: channel strips, master tube stage, voices, scheduler.
-// Browser-only (needs AudioContext). Pure math lives in ../src/dsp.js and ../src/sequencer.js.
+// Console-8 — WebAudio engine: channel strips, master tube stage, tape transport.
+// Browser-only (needs AudioContext). Pure math lives in ../src/*.js.
+import { dbToGain, faderToGain, tubeCurve } from '../src/dsp.js';
 import {
-  dbToGain, faderToGain, tubeCurve, midiToFreq, MELODIC,
-} from '../src/dsp.js';
-import { STEPS, CHANNELS, stepDur } from '../src/sequencer.js';
+  TRACKS, ST_STOPPED, ST_PLAYING, ST_RECORDING, Transport,
+  newClip, clipEnd, allClips, mixEnd, VS_MIN, VS_MAX,
+} from '../src/tape.js';
+import { encodeWav16 } from '../src/wav.js';
 
-const ACCENT_VEL = 1.0;
-const NORMAL_VEL = 0.62;
+/** Interleaved pcm -> AudioBuffer. */
+export function pcmToBuffer(ctx, pcm) {
+  const frames = Math.floor(pcm.data.length / pcm.channels);
+  const buf = ctx.createBuffer(pcm.channels, frames, pcm.sampleRate);
+  for (let ch = 0; ch < pcm.channels; ch++) {
+    const d = buf.getChannelData(ch);
+    for (let f = 0; f < frames; f++) d[f] = pcm.data[f * pcm.channels + ch];
+  }
+  return buf;
+}
+
+/** AudioBuffer -> interleaved pcm. */
+export function bufferToPcm(buf) {
+  const frames = buf.length;
+  const channels = buf.numberOfChannels;
+  const data = new Float32Array(frames * channels);
+  for (let ch = 0; ch < channels; ch++) {
+    const d = buf.getChannelData(ch);
+    for (let f = 0; f < frames; f++) data[f * channels + ch] = d[f];
+  }
+  return { sampleRate: buf.sampleRate, channels, data };
+}
+
+export function audibleAt(project, i) {
+  const chans = project.channels;
+  const anySolo = chans.some((c) => c.solo);
+  const p = chans[i];
+  return p.mute ? false : anySolo ? !!p.solo : true;
+}
 
 export class AudioEngine {
   constructor() {
     this.ctx = null;
-    this.project = null;      // set by app; mutated in place
-    this.playing = false;
-    this.step = 0;
-    this.songIdx = 0;
-    this.nextTime = 0;
-    this.timerID = null;
-    this.onStep = null;       // (step, patternId) => void, for the playhead
-    this.samples = new Array(CHANNELS).fill(null);
+    this.project = null; // set by app; mutated in place
+    this.transport = new Transport();
+    this.varispeed = 1.0;
+    this.active = []; // live clip BufferSources
+    this.anchor = { t: 0, pos: 0 };
     this._peakBuf = new Float32Array(512);
+    this.micStream = null;
+    this.micError = null;
+    this.monitorGains = [];
+    this.recorder = null;
+    this.recChunks = [];
+    this.recTracks = [];
+    this.onState = null; // () => void, UI refresh hook
+    this.onMic = null; // (status: 'ok'|'error', detail?) => void
   }
 
   async init() {
@@ -27,24 +61,28 @@ export class AudioEngine {
     const AC = window.AudioContext || window.webkitAudioContext;
     this.ctx = new AC({ latencyHint: 'interactive' });
     if (this.ctx.state === 'suspended') await this.ctx.resume();
-    this.noiseBuf = this.makeNoise();
-    this.buildMaster();
+    this.master = this.buildMasterGraph(this.ctx);
+    this.master.fader.connect(this.ctx.destination);
     this.channels = [];
-    for (let i = 0; i < CHANNELS; i++) this.channels.push(this.buildChannel(i));
+    for (let i = 0; i < TRACKS; i++) this.channels.push(this.buildChannelGraph(this.ctx));
+    this.wireBus();
   }
 
-  makeNoise() {
-    const len = this.ctx.sampleRate * 2;
-    const buf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
-    const d = buf.getChannelData(0);
-    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
-    return buf;
+  async ensureCtx() {
+    if (!this.ctx) {
+      await this.init();
+      this.applyAll();
+    }
+    if (this.ctx.state === 'suspended') await this.ctx.resume();
   }
 
-  // ---------- channel strip ----------
-  // source -> EQ(4) -> comp -> makeup -> limiter -> invert -> pan -> fader -> mute -> analyser -> bus
-  buildChannel() {
-    const c = this.ctx;
+  _emit() {
+    if (this.onState) this.onState();
+  }
+
+  // ---------- channel strip graph ----------
+  // input -> EQ(4) -> comp -> makeup -> limiter -> invert -> pan -> fader -> mute -> analyser
+  buildChannelGraph(c) {
     const ch = {};
     ch.input = c.createGain();
     const mk = (type, freq, q) => {
@@ -79,8 +117,7 @@ export class AudioEngine {
     return ch;
   }
 
-  applyChannel(i, p) {
-    const ch = this.channels[i];
+  applyChannelNodes(ch, p) {
     const eq = p.eq;
     const set = (node, band) => {
       node.frequency.value = band.freq;
@@ -100,22 +137,24 @@ export class AudioEngine {
     ch.invert.gain.value = p.invert ? -1 : 1;
     ch.pan.pan.value = p.pan;
     ch.fader.gain.value = faderToGain(p.fader);
+  }
+
+  applyChannel(i, p) {
+    this.applyChannelNodes(this.channels[i], p);
     this.updateMutes();
   }
 
   updateMutes() {
-    if (!this.project) return;
-    const anySolo = this.project.channels.some((c) => c.solo);
+    if (!this.project || !this.ctx) return;
+    const now = this.ctx.currentTime;
     this.project.channels.forEach((p, i) => {
-      const audible = p.mute ? false : anySolo ? p.solo : true;
-      this.channels[i].muteG.gain.setTargetAtTime(audible ? 1 : 0, this.ctx.currentTime, 0.01);
+      this.channels[i].muteG.gain.setTargetAtTime(audibleAt(this.project, i) ? 1 : 0, now, 0.01);
     });
   }
 
-  // ---------- master: bus -> TUBE -> limiter -> fader -> out ----------
-  buildMaster() {
-    const c = this.ctx;
-    const m = (this.master = {});
+  // ---------- master: bus -> TUBE -> limiter -> fader ----------
+  buildMasterGraph(c) {
+    const m = {};
     m.bus = c.createGain();
     m.tubeDry = c.createGain();
     m.tubePre = c.createGain();
@@ -141,9 +180,7 @@ export class AudioEngine {
     m.anL = c.createAnalyser(); m.anR = c.createAnalyser();
     m.anL.fftSize = 512; m.anR.fftSize = 512;
     m.splitter.connect(m.anL, 0); m.splitter.connect(m.anR, 1);
-    m.fader.connect(c.destination);
-    // channel analysers feed the bus
-    this._busWired = false;
+    return m;
   }
 
   wireBus() {
@@ -152,8 +189,7 @@ export class AudioEngine {
     this._busWired = true;
   }
 
-  applyMaster(p) {
-    const m = this.master;
+  applyMasterNodes(m, p) {
     m.tubePre.gain.value = 1 + p.tubeDrive * 5; // 1x .. 6x into the shaper
     const a = (p.tubeMix * Math.PI) / 2;
     m.tubeDry.gain.value = Math.cos(a);
@@ -162,188 +198,267 @@ export class AudioEngine {
     m.fader.gain.value = faderToGain(p.fader);
   }
 
-  // ---------- voices ----------
-  noiseSrc(t, dur) {
-    const s = this.ctx.createBufferSource();
-    s.buffer = this.noiseBuf; s.loop = true;
-    s.start(t); s.stop(t + dur + 0.05);
-    return s;
+  applyMaster(p) {
+    this.applyMasterNodes(this.master, p);
   }
 
-  envGain(t, peak, decay, attack = 0.003) {
-    const g = this.ctx.createGain();
-    g.gain.setValueAtTime(0.0001, t);
-    g.gain.exponentialRampToValueAtTime(Math.max(peak, 0.0002), t + attack);
-    g.gain.exponentialRampToValueAtTime(0.0001, t + attack + decay);
-    return g;
+  applyAll() {
+    for (let i = 0; i < TRACKS; i++) this.applyChannel(i, this.project.channels[i]);
+    this.applyMaster(this.project.master);
   }
 
-  kick(t, vel, out) {
-    const c = this.ctx;
-    const o = c.createOscillator(); o.type = 'sine';
-    o.frequency.setValueAtTime(160, t);
-    o.frequency.exponentialRampToValueAtTime(43, t + 0.11);
-    const g = this.envGain(t, 0.9 * vel, 0.42);
-    o.connect(g); g.connect(out); o.start(t); o.stop(t + 0.55);
-    const click = this.noiseSrc(t, 0.03);
-    const hp = c.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 1200;
-    const cg = this.envGain(t, 0.25 * vel, 0.025, 0.001);
-    click.connect(hp); hp.connect(cg); cg.connect(out);
-  }
-
-  snare(t, vel, out) {
-    const c = this.ctx;
-    const n = this.noiseSrc(t, 0.25);
-    const bp = c.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 1900; bp.Q.value = 0.8;
-    const g = this.envGain(t, 0.55 * vel, 0.17);
-    n.connect(bp); bp.connect(g); g.connect(out);
-    const o = c.createOscillator(); o.type = 'triangle'; o.frequency.value = 186;
-    const og = this.envGain(t, 0.4 * vel, 0.09);
-    o.connect(og); og.connect(out); o.start(t); o.stop(t + 0.2);
-  }
-
-  clap(t, vel, out) {
-    const c = this.ctx;
-    const bp = c.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 1150; bp.Q.value = 1.6;
-    bp.connect(out);
-    [0, 0.012, 0.025, 0.041].forEach((dt, i) => {
-      const n = this.noiseSrc(t + dt, 0.06);
-      const g = this.envGain(t + dt, (0.5 - i * 0.07) * vel, 0.05, 0.001);
-      n.connect(bp); bp.connect(g); g.connect(out);
-    });
-  }
-
-  hat(t, vel, out, open) {
-    const c = this.ctx;
-    const n = this.noiseSrc(t, open ? 0.4 : 0.08);
-    const hp = c.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 7800;
-    const g = this.envGain(t, 0.32 * vel, open ? 0.32 : 0.045, 0.001);
-    n.connect(hp); hp.connect(g); g.connect(out);
-  }
-
-  bass(t, vel, out, midi) {
-    const c = this.ctx;
-    const f = midiToFreq(midi);
-    const o = c.createOscillator(); o.type = 'sawtooth'; o.frequency.value = f;
-    const sub = c.createOscillator(); sub.type = 'sine'; sub.frequency.value = f / 2;
-    const lp = c.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 7;
-    lp.frequency.setValueAtTime(300 + vel * 1100, t);
-    lp.frequency.exponentialRampToValueAtTime(220, t + 0.25);
-    const g = this.envGain(t, 0.6 * vel, 0.34);
-    const sg = c.createGain(); sg.gain.value = 0.5;
-    o.connect(lp); sub.connect(sg); sg.connect(lp); lp.connect(g); g.connect(out);
-    o.start(t); o.stop(t + 0.5); sub.start(t); sub.stop(t + 0.5);
-  }
-
-  keys(t, vel, out, midi) {
-    const c = this.ctx;
-    const f = midiToFreq(midi);
-    const lp = c.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 2600; lp.Q.value = 0.7;
-    const g = this.envGain(t, 0.34 * vel, 0.55, 0.008);
-    lp.connect(g); g.connect(out);
-    for (const det of [-7, 5]) {
-      const o = c.createOscillator(); o.type = 'sawtooth';
-      o.frequency.value = f; o.detune.value = det;
-      const og = c.createGain(); og.gain.value = 0.5;
-      o.connect(og); og.connect(lp); o.start(t); o.stop(t + 0.75);
-    }
-  }
-
-  lead(t, vel, out, midi) {
-    const c = this.ctx;
-    const f = midiToFreq(midi);
-    const o = c.createOscillator(); o.type = 'square'; o.frequency.value = f;
-    const lfo = c.createOscillator(); lfo.frequency.value = 5.5;
-    const lfoG = c.createGain(); lfoG.gain.value = 7;
-    lfo.connect(lfoG); lfoG.connect(o.detune);
-    const lp = c.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 4;
-    lp.frequency.setValueAtTime(1400, t);
-    lp.frequency.exponentialRampToValueAtTime(4200, t + 0.06);
-    lp.frequency.exponentialRampToValueAtTime(1500, t + 0.3);
-    const g = this.envGain(t, 0.3 * vel, 0.3, 0.005);
-    o.connect(lp); lp.connect(g); g.connect(out);
-    o.start(t); o.stop(t + 0.45); lfo.start(t); lfo.stop(t + 0.45);
-  }
-
-  sample(t, vel, out, buf) {
-    const c = this.ctx;
-    const s = c.createBufferSource(); s.buffer = buf;
-    const g = this.envGain(t, 0.85 * vel, Math.min(1.5, buf.duration), 0.004);
-    s.connect(g); g.connect(out); s.start(t);
-  }
-
-  trigger(chIdx, stepVal, t) {
-    const p = this.project.channels[chIdx];
-    const out = this.channels[chIdx].input;
-    const vel = stepVal === 2 ? ACCENT_VEL : NORMAL_VEL;
-    const note = p.note || 60;
-    switch (p.source) {
-      case 'kick': this.kick(t, vel, out); break;
-      case 'snare': this.snare(t, vel, out); break;
-      case 'clap': this.clap(t, vel, out); break;
-      case 'chat': this.hat(t, vel, out, false); break;
-      case 'ohat': this.hat(t, vel, out, true); break;
-      case 'bass': this.bass(t, vel, out, note); break;
-      case 'keys': this.keys(t, vel, out, note); break;
-      case 'lead': this.lead(t, vel, out, note); break;
-      case 'sample': if (this.samples[chIdx]) this.sample(t, vel, out, this.samples[chIdx]); break;
-    }
-  }
-
-  // ---------- transport + lookahead scheduler ----------
-  play() {
-    if (!this.ctx || this.playing) return;
-    this.playing = true;
-    this.step = 0;
-    this.songIdx = 0;
-    this.nextTime = this.ctx.currentTime + 0.06;
-    this.timerID = setInterval(() => this.tick(), 25);
-  }
-
-  stop() {
-    this.playing = false;
-    clearInterval(this.timerID);
-    this.timerID = null;
-    if (this.onStep) this.onStep(-1, this.project.currentPattern);
-  }
-
-  currentPatternId() {
-    const pr = this.project;
-    if (pr.songMode && pr.song.length > 0) return pr.song[this.songIdx % pr.song.length];
-    return pr.currentPattern;
-  }
-
-  tick() {
-    if (!this.playing) return;
-    const ahead = this.ctx.currentTime + 0.12;
-    while (this.nextTime < ahead) {
-      const pr = this.project;
-      const dur = stepDur(pr.tempo);
-      const pid = this.currentPatternId();
-      // swing delays off-beat 16ths without shifting the grid
-      const t = this.nextTime + (this.step % 2 === 1 ? pr.swing * dur : 0);
-      const pattern = pr.patterns[pid];
-      for (let ch = 0; ch < CHANNELS; ch++) {
-        const v = pattern[ch][this.step];
-        if (v > 0 && this.audible(ch)) this.trigger(ch, v, t);
+  // ---------- mic + monitoring ----------
+  async ensureMic() {
+    if (this.micStream) return this.micStream;
+    if (this.micError) return null;
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('getUserMedia unavailable');
       }
-      const s = this.step, id = pid;
-      const ms = Math.max(0, (t - this.ctx.currentTime) * 1000);
-      setTimeout(() => { if (this.playing && this.onStep) this.onStep(s, id); }, ms);
-      this.step++;
-      if (this.step >= STEPS) {
-        this.step = 0;
-        if (pr.songMode) this.songIdx++;
-      }
-      this.nextTime += dur;
+      const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+      this.micStream = s;
+      this._buildMicGraph();
+      if (this.onMic) this.onMic('ok');
+      return s;
+    } catch (e) {
+      this.micError = (e && e.name) || 'denied';
+      if (this.onMic) this.onMic('error', this.micError);
+      return null;
     }
   }
 
-  audible(ch) {
-    const chans = this.project.channels;
-    const anySolo = chans.some((c) => c.solo);
-    const p = chans[ch];
-    return p.mute ? false : anySolo ? !!p.solo : true;
+  _buildMicGraph() {
+    const c = this.ctx;
+    this.micSrc = c.createMediaStreamSource(this.micStream);
+    this.monitorGains = [];
+    for (let i = 0; i < TRACKS; i++) {
+      const g = c.createGain();
+      g.gain.value = 0;
+      this.micSrc.connect(g);
+      g.connect(this.channels[i].input);
+      this.monitorGains.push(g);
+    }
+  }
+
+  setMonitor(i, on) {
+    if (!this.ctx || !this.monitorGains[i]) return;
+    this.monitorGains[i].gain.setTargetAtTime(on ? 1 : 0, this.ctx.currentTime, 0.02);
+  }
+
+  // ---------- tape transport ----------
+  positionNow() {
+    if (!this.ctx || this.transport.state === ST_STOPPED) return this.transport.position;
+    return Math.max(0, this.anchor.pos + (this.ctx.currentTime - this.anchor.t) * this.varispeed);
+  }
+
+  _startPlayback(fromPos) {
+    this._stopSources();
+    const t0 = this.ctx.currentTime + 0.06;
+    for (let i = 0; i < TRACKS; i++) {
+      for (const clip of this.project.tracks[i].clips) {
+        if (!clip.pcm) continue;
+        if (clipEnd(clip) <= fromPos + 1e-6) continue;
+        const s = this.ctx.createBufferSource();
+        s.buffer = this._clipBuffer(clip);
+        s.playbackRate.value = this.varispeed;
+        s.connect(this.channels[i].input);
+        const offset = Math.max(0, fromPos - clip.startOffset);
+        try {
+          s.start(t0, offset);
+        } catch {
+          continue;
+        }
+        this.active.push(s);
+      }
+    }
+    this.anchor = { t: t0, pos: fromPos };
+  }
+
+  _stopSources() {
+    for (const s of this.active) {
+      try { s.stop(); } catch { /* already ended */ }
+      try { s.disconnect(); } catch { /* noop */ }
+    }
+    this.active = [];
+  }
+
+  _clipBuffer(clip) {
+    if (!clip._buf) clip._buf = pcmToBuffer(this.ctx, clip.pcm);
+    return clip._buf;
+  }
+
+  async play() {
+    await this.ensureCtx();
+    const r = this.transport.play();
+    if (!r.ok) return r;
+    if (!r.punchedOut) this._startPlayback(this.transport.position);
+    this._emit();
+    return r;
+  }
+
+  async rec() {
+    await this.ensureCtx();
+    const wasPlaying = this.transport.state === ST_PLAYING;
+    const r = this.transport.rec();
+    if (!r.ok) return r;
+    const recTracks = [...this.transport.armed].filter((i) => this.project.tracks[i].input === 'mic');
+    if (recTracks.length === 0) {
+      this.transport.stop();
+      return { ok: false, reason: 'armed tracks are set to File input' };
+    }
+    const mic = await this.ensureMic();
+    if (!mic) {
+      this.transport.stop();
+      return { ok: false, reason: 'mic unavailable' };
+    }
+    if (!wasPlaying) this._startPlayback(this.transport.position);
+    this.recTracks = recTracks;
+    this.recChunks = [];
+    let recorder;
+    try {
+      recorder = new MediaRecorder(mic);
+    } catch {
+      this.transport.stop();
+      return { ok: false, reason: 'recorder unsupported' };
+    }
+    this.recorder = recorder;
+    this._recDone = new Promise((res) => { this._recDoneRes = res; });
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size) this.recChunks.push(e.data);
+    };
+    recorder.onstop = () => this._recDoneRes();
+    recorder.start(250);
+    this._emit();
+    return { ok: true, tracks: recTracks, punchedIn: wasPlaying };
+  }
+
+  async stop() {
+    if (this.ctx) this.transport.position = this.positionNow();
+    const r = this.transport.stop();
+    this._stopSources();
+    if (this.recorder) {
+      const rec = this.recorder;
+      this.recorder = null;
+      try {
+        rec.stop();
+        await this._recDone;
+        await this._finalizeTake(r.take);
+      } catch {
+        /* recorder failed mid-stop: keep the tape rolling state clean */
+      }
+    }
+    this._emit();
+    return r;
+  }
+
+  async _finalizeTake(take) {
+    const chunks = this.recChunks;
+    this.recChunks = [];
+    if (!take || !chunks.length) return null;
+    try {
+      const blob = new Blob(chunks, { type: (chunks[0] && chunks[0].type) || 'audio/webm' });
+      const ab = await blob.arrayBuffer();
+      const buf = await this.ctx.decodeAudioData(ab);
+      if (!buf || buf.duration < 0.05) return null;
+      const pcm = bufferToPcm(buf);
+      const made = [];
+      for (const i of this.recTracks) {
+        const clip = newClip(i, take.start, 'take');
+        clip.pcm = pcm;
+        clip.duration = buf.duration;
+        this.project.tracks[i].clips.push(clip);
+        made.push(clip);
+      }
+      return made;
+    } catch {
+      return null;
+    }
+  }
+
+  rtz() {
+    const r = this.transport.rtz();
+    if (r.ok && this.ctx && this.transport.state !== ST_STOPPED) this._startPlayback(0);
+    this._emit();
+    return r;
+  }
+
+  seek(t) {
+    const r = this.transport.seek(t);
+    if (!r.ok) return r;
+    if (this.ctx && this.transport.state !== ST_STOPPED) this._startPlayback(t);
+    this._emit();
+    return r;
+  }
+
+  setVarispeed(rate) {
+    const nr = Math.min(VS_MAX, Math.max(VS_MIN, rate));
+    if (this.ctx && this.transport.state !== ST_STOPPED) {
+      const pos = this.positionNow();
+      this.anchor = { t: this.ctx.currentTime, pos };
+      this.transport.position = pos;
+    }
+    this.varispeed = nr;
+    for (const s of this.active) {
+      try { s.playbackRate.value = nr; } catch { /* noop */ }
+    }
+    if (this.project) this.project.varispeed = nr;
+  }
+
+  // ---------- clips: import + test hooks ----------
+  async importFile(i, file, atTime) {
+    await this.ensureCtx();
+    const ab = await file.arrayBuffer();
+    const buf = await this.ctx.decodeAudioData(ab);
+    const clip = newClip(i, atTime ?? this.transport.position,
+      (file.name || 'import').replace(/\.[^.]+$/, '').slice(0, 32) || 'import');
+    clip.pcm = bufferToPcm(buf);
+    clip.duration = buf.duration;
+    this.project.tracks[i].clips.push(clip);
+    this._emit();
+    return clip;
+  }
+
+  /** Headless-test hook: synthesize a tone clip straight into the model. */
+  addTestTone(i, { freq = 440, dur = 1.0, start = 0, sr = 44100 } = {}) {
+    const n = Math.max(1, Math.floor(dur * sr));
+    const data = new Float32Array(n);
+    for (let k = 0; k < n; k++) data[k] = 0.5 * Math.sin((2 * Math.PI * freq * k) / sr);
+    const clip = newClip(i, start, 'test');
+    clip.pcm = { sampleRate: sr, channels: 1, data };
+    clip.duration = dur;
+    this.project.tracks[i].clips.push(clip);
+    return clip;
+  }
+
+  // ---------- mixdown ----------
+  async bounceToWav() {
+    const end = mixEnd(this.project);
+    if (end <= 0 || !allClips(this.project).some((c) => c.pcm)) {
+      return { ok: false, reason: 'tape is empty' };
+    }
+    const sr = 44100;
+    const off = new OfflineAudioContext(2, Math.ceil(end * sr) + sr, sr);
+    const bus = off.createGain();
+    const m = this.buildMasterGraph(off);
+    this.applyMasterNodes(m, this.project.master);
+    m.fader.connect(off.destination);
+    bus.connect(m.bus);
+    for (let i = 0; i < TRACKS; i++) {
+      const ch = this.buildChannelGraph(off);
+      this.applyChannelNodes(ch, this.project.channels[i]);
+      if (!audibleAt(this.project, i)) ch.muteG.gain.value = 0;
+      ch.analyser.connect(bus);
+      for (const clip of this.project.tracks[i].clips) {
+        if (!clip.pcm) continue;
+        const s = off.createBufferSource();
+        s.buffer = pcmToBuffer(off, clip.pcm);
+        s.playbackRate.value = this.varispeed;
+        s.connect(ch.input);
+        s.start(Math.max(0, clip.startOffset));
+      }
+    }
+    const rendered = await off.startRendering();
+    return { ok: true, wav: encodeWav16(bufferToPcm(rendered)), seconds: end };
   }
 
   // ---------- metering ----------
@@ -360,10 +475,4 @@ export class AudioEngine {
   channelPeak(i) { return this.peak(this.channels[i].analyser); }
   channelGR(i) { return this.channels[i].comp.reduction || 0; }
   masterPeaks() { return [this.peak(this.master.anL), this.peak(this.master.anR)]; }
-
-  async loadSample(ch, file) {
-    const ab = await file.arrayBuffer();
-    this.samples[ch] = await this.ctx.decodeAudioData(ab);
-    return this.samples[ch].duration;
-  }
 }

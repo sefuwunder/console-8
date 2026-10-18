@@ -51,13 +51,6 @@ export function panToGains(pan) {
   return [Math.cos(a), Math.sin(a)];
 }
 
-export const midiToFreq = (m) => 440 * Math.pow(2, (m - 69) / 12);
-
-export const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
-export function midiToName(m) {
-  return NOTE_NAMES[((m % 12) + 12) % 12] + (Math.floor(m / 12) - 1);
-}
-
 /** SSL-style 4-band EQ defaults + knob ranges. */
 export function eqDefaults() {
   return {
@@ -77,20 +70,9 @@ export function limiterDefaults() {
   return { ceiling: -1.5, release: 0.08 };
 }
 
-export const SOURCES = ['kick', 'snare', 'clap', 'chat', 'ohat', 'bass', 'keys', 'lead', 'sample'];
-export const SOURCE_LABELS = {
-  kick: 'Kick', snare: 'Snare', clap: 'Clap', chat: 'ClHat', ohat: 'OpHat',
-  bass: 'Bass', keys: 'Keys', lead: 'Lead', sample: 'Sample',
-};
-export const MELODIC = new Set(['bass', 'keys', 'lead']);
-export const DEFAULT_NOTES = { bass: 36, keys: 60, lead: 72 }; // C2, C4, C5
-
 /** Default per-channel strip state (UI + engine params). */
-export function channelDefaults(i) {
-  const srcOrder = ['kick', 'snare', 'chat', 'ohat', 'bass', 'keys', 'clap', 'lead'];
+export function channelDefaults() {
   return {
-    source: srcOrder[i % srcOrder.length],
-    note: DEFAULT_NOTES[srcOrder[i % srcOrder.length]] ?? 60,
     eq: eqDefaults(),
     comp: compDefaults(),
     limiter: limiterDefaults(),

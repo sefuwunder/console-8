@@ -1,12 +1,12 @@
-// Console-8 — UI: console strips, knobs, sequencer, transport, meters.
+// Console-8 — UI: console strips, tape machine, transport, meters.
 import {
-  knobToLog, knobToLin, logToKnob, midiToName,
-  SOURCE_LABELS, MELODIC, eqDefaults,
+  knobToLog, knobToLin, logToKnob, eqDefaults,
 } from '../src/dsp.js';
 import {
-  STEPS, CHANNELS, PATTERN_IDS, toggleStep,
-  newProject, serializeProject, deserializeProject,
-} from '../src/sequencer.js';
+  TRACKS, ST_STOPPED, ST_PLAYING, ST_RECORDING,
+  newProject, serializeProject, serializeAutosave, deserializeProject,
+  varispeedToRate, rateToVarispeed, fmtCounter, mixEnd, clipEnd, pcmPeak,
+} from '../src/tape.js';
 import { AudioEngine } from './engine.js';
 
 const $ = (sel, r = document) => r.querySelector(sel);
@@ -137,14 +137,20 @@ try {
   if (saved) project = deserializeProject(saved);
 } catch { /* fresh project */ }
 engine.project = project;
+engine.varispeed = project.varispeed || 1.0;
+const monState = new Array(TRACKS).fill(false);
 
 let saveTimer = null;
 function autosave() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    try { localStorage.setItem('console-8-project', serializeProject(project)); } catch {}
-    $('#save-state').textContent = 'autosaved ' + new Date().toLocaleTimeString();
+    try { localStorage.setItem('console-8-project', serializeAutosave(project)); } catch {}
+    $('#save-state').textContent = 'autosaved ' + new Date().toLocaleTimeString() + ' (settings only, no audio)';
   }, 600);
+}
+
+function toast(msg) {
+  $('#save-state').textContent = msg;
 }
 
 function applyChannel(i) {
@@ -154,78 +160,66 @@ function applyMaster() {
   if (engine.ctx) engine.applyMaster(project.master);
 }
 function applyAll() {
-  for (let i = 0; i < CHANNELS; i++) applyChannel(i);
+  for (let i = 0; i < TRACKS; i++) applyChannel(i);
   applyMaster();
 }
 
-// ---------------- top bar ----------------
+// ---------------- top bar: transport + tape ----------------
+let recBtn, playBtn, stopBtn, rtzBtn, counterEl, vsKnob, reelL, reelR, micEl;
+let reelAngle = 0, lastFrameT = 0;
+
 function buildTopbar() {
   const bar = $('#topbar');
   bar.append(el('div', 'logo', 'CONSOLE-8'));
+
   const tp = el('div', 'transport');
-  const playBtn = el('button', 'play-btn', '▶ PLAY');
+  recBtn = el('button', 'tbtn rec', '⏺ REC');
+  recBtn.id = 'rec-btn';
+  recBtn.onclick = onRec;
+  playBtn = el('button', 'tbtn play', '▶ PLAY');
   playBtn.id = 'play-btn';
-  playBtn.onclick = togglePlay;
-  tp.appendChild(playBtn);
+  playBtn.onclick = onPlay;
+  stopBtn = el('button', 'tbtn stop', '⏹ STOP');
+  stopBtn.id = 'stop-btn';
+  stopBtn.onclick = onStop;
+  rtzBtn = el('button', 'tbtn rtz', '⏮ RTZ');
+  rtzBtn.id = 'rtz-btn';
+  rtzBtn.onclick = onRtz;
+  tp.append(recBtn, playBtn, stopBtn, rtzBtn);
   bar.appendChild(tp);
 
-  const tempoWrap = el('div', 'top-group');
-  tempoWrap.appendChild(el('span', 'top-label', 'TEMPO'));
-  const tempoKnob = makeKnob(tempoWrap, {
-    label: 'BPM', min: 60, max: 200, value: project.tempo, format: (v) => Math.round(v) + '',
-    accent: '#7fd4a8',
-    onChange: (v) => { project.tempo = Math.round(v); autosave(); },
-  });
-  window._tempoKnob = tempoKnob;
-  const swingKnob = makeKnob(tempoWrap, {
-    label: 'SWING', min: 0, max: 0.6, value: project.swing, format: (v) => Math.round(v * 100) + '%',
-    accent: '#7fb8d4',
-    onChange: (v) => { project.swing = v; autosave(); },
-  });
-  window._swingKnob = swingKnob;
-  bar.appendChild(tempoWrap);
+  counterEl = el('div', 'counter', '00:00');
+  counterEl.id = 'counter';
+  bar.appendChild(counterEl);
 
-  const patWrap = el('div', 'top-group');
-  patWrap.appendChild(el('span', 'top-label', 'PATTERN'));
-  const patBtns = el('div', 'pat-btns');
-  window._patBtns = {};
-  for (const id of PATTERN_IDS) {
-    const b = el('button', 'pat-btn' + (project.currentPattern === id ? ' active' : ''), id);
-    b.onclick = () => selectPattern(id);
-    window._patBtns[id] = b;
-    patBtns.appendChild(b);
-  }
-  patWrap.appendChild(patBtns);
-  bar.appendChild(patWrap);
+  const vsWrap = el('div', 'top-group');
+  vsWrap.appendChild(el('span', 'top-label', 'VARISPEED'));
+  vsKnob = makeKnob(vsWrap, {
+    label: 'RATE', min: 0, max: 1, value: rateToVarispeed(engine.varispeed),
+    format: (v) => varispeedToRate(v).toFixed(2) + 'x', accent: '#e07840',
+    onChange: (v) => {
+      const vv = Math.abs(v - 0.5) < 0.03 ? 0.5 : v; // center detent
+      engine.setVarispeed(varispeedToRate(vv));
+      autosave();
+    },
+  });
+  vsKnob.defPos = 0.5; // double-click = 1.00x
+  bar.appendChild(vsWrap);
 
-  const songWrap = el('div', 'top-group');
-  songWrap.appendChild(el('span', 'top-label', 'SONG'));
-  const songToggle = el('button', 'song-toggle' + (project.songMode ? ' active' : ''), project.songMode ? 'SONG: ON' : 'SONG: OFF');
-  songToggle.onclick = () => {
-    project.songMode = !project.songMode;
-    songToggle.textContent = project.songMode ? 'SONG: ON' : 'SONG: OFF';
-    songToggle.classList.toggle('active', project.songMode);
-    autosave();
+  const reels = el('div', 'reels');
+  reelL = el('canvas', 'reel'); reelL.width = reelL.height = 54;
+  reelR = el('canvas', 'reel'); reelR.width = reelR.height = 54;
+  reels.append(reelL, reelR);
+  bar.appendChild(reels);
+
+  micEl = el('span', 'mic-unknown', '● MIC');
+  micEl.id = 'mic-status';
+  micEl.title = 'microphone: unknown';
+  bar.appendChild(micEl);
+  engine.onMic = (st, detail) => {
+    micEl.className = st === 'ok' ? 'mic-ok' : 'mic-error';
+    micEl.title = 'microphone: ' + (st === 'ok' ? 'ready' : detail || 'unavailable');
   };
-  window._songToggle = songToggle;
-  songWrap.appendChild(songToggle);
-  const songRow = el('div', 'song-row');
-  window._songChips = el('div', 'song-chips');
-  songRow.appendChild(window._songChips);
-  const addRow = el('div', 'song-add');
-  for (const id of PATTERN_IDS) {
-    const b = el('button', 'song-add-btn', '+' + id);
-    b.onclick = () => { project.song.push(id); renderSong(); autosave(); };
-    addRow.appendChild(b);
-  }
-  const back = el('button', 'song-add-btn', '⌫');
-  back.onclick = () => { project.song.pop(); renderSong(); autosave(); };
-  const clr = el('button', 'song-add-btn', 'CLR');
-  clr.onclick = () => { project.song = []; renderSong(); autosave(); };
-  addRow.append(back, clr);
-  songRow.appendChild(addRow);
-  songWrap.appendChild(songRow);
-  bar.appendChild(songWrap);
 
   const fileWrap = el('div', 'top-group');
   const saveBtn = el('button', 'file-btn', 'SAVE');
@@ -244,34 +238,75 @@ function buildTopbar() {
     loadInput.value = '';
   };
   loadBtn.onclick = () => loadInput.click();
-  fileWrap.append(saveBtn, loadBtn, loadInput, el('span', 'save-state', ''));
-  loadInput.id = 'load-input';
-  fileWrap.querySelector('.save-state').id = 'save-state';
+  const bounceBtn = el('button', 'file-btn bounce', 'BOUNCE');
+  bounceBtn.id = 'bounce-btn';
+  bounceBtn.onclick = onBounce;
+  const ss = el('span', 'save-state', '');
+  ss.id = 'save-state';
+  fileWrap.append(saveBtn, loadBtn, bounceBtn, loadInput, ss);
   bar.appendChild(fileWrap);
-  renderSong();
+
+  engine.onState = refreshTransport;
+  refreshTransport();
 }
 
-function renderSong() {
-  const w = window._songChips;
-  w.innerHTML = '';
-  project.song.forEach((id) => w.appendChild(el('span', 'song-chip', id)));
-  if (!project.song.length) w.appendChild(el('span', 'song-empty', '— empty —'));
+async function onRec() {
+  const r = await engine.rec();
+  if (!r.ok) toast('REC: ' + r.reason);
+  refreshTransport();
+  renderLanes();
+}
+async function onPlay() {
+  const r = await engine.play();
+  if (!r.ok) toast('PLAY: ' + (r.reason || 'busy'));
+  refreshTransport();
+}
+async function onStop() {
+  toast('stopping…');
+  await engine.stop();
+  toast('stopped');
+  refreshTransport();
+  renderLanes();
+}
+function onRtz() {
+  const r = engine.rtz();
+  if (!r.ok) toast('RTZ: ' + r.reason);
+  refreshTransport();
+}
+async function onBounce() {
+  toast('bouncing mix…');
+  const r = await engine.bounceToWav();
+  if (!r.ok) { toast('BOUNCE: ' + r.reason); return; }
+  const blob = new Blob([r.wav], { type: 'audio/wav' });
+  const a = el('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'console-8-mixdown.wav';
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  toast('bounced ' + r.seconds.toFixed(1) + 's mixdown');
 }
 
-function selectPattern(id) {
-  project.currentPattern = id;
-  for (const k of PATTERN_IDS) window._patBtns[k].classList.toggle('active', k === id);
-  renderGrid();
-  autosave();
+function refreshTransport() {
+  const st = engine.transport.state;
+  const anyArmed = engine.transport.armed.size > 0;
+  recBtn.classList.toggle('armed', anyArmed);
+  recBtn.classList.toggle('recording', st === ST_RECORDING);
+  playBtn.classList.toggle('playing', st === ST_PLAYING || st === ST_RECORDING);
+  playBtn.textContent = st === ST_STOPPED ? '▶ PLAY' : '▶ PLAY';
+  for (let i = 0; i < TRACKS; i++) {
+    const b = stripRefs[i] && stripRefs[i].armBtn;
+    if (b) b.classList.toggle('armed', engine.transport.armed.has(i));
+  }
 }
 
 function downloadProject() {
-  const blob = new Blob([serializeProject(project)], { type: 'application/json' });
+  const blob = new Blob([serializeProject(project, true)], { type: 'application/json' });
   const a = el('a');
   a.href = URL.createObjectURL(blob);
   a.download = 'console-8-project.json';
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  toast('project saved (with audio)');
 }
 
 // ---------------- channel strips ----------------
@@ -288,68 +323,67 @@ function sectionTitle(parent, text, extra) {
 
 function buildStrip(i) {
   const p = project.channels[i];
+  const tp = project.tracks[i];
   const strip = el('div', 'strip');
   const refs = { knobs: {} };
   stripRefs[i] = refs;
 
   const head = el('div', 'strip-head');
   head.appendChild(el('span', 'ch-num', String(i + 1).padStart(2, '0')));
-  const srcSel = el('select', 'src-sel');
-  for (const s of ['kick', 'snare', 'clap', 'chat', 'ohat', 'bass', 'keys', 'lead', 'sample']) {
-    const o = el('option', '', SOURCE_LABELS[s]);
-    o.value = s;
-    srcSel.appendChild(o);
-  }
-  srcSel.value = p.source;
-  srcSel.onchange = () => {
-    p.source = srcSel.value;
-    noteSel.style.display = MELODIC.has(p.source) ? '' : 'none';
-    loadSampleBtn.style.display = p.source === 'sample' ? '' : 'none';
-    renderRowLabel(i);
-    autosave();
+  const armBtn = el('button', 'arm-btn', 'ARM');
+  armBtn.title = 'arm track for recording';
+  armBtn.onclick = () => {
+    engine.transport.toggleArm(i);
+    armBtn.classList.toggle('armed', engine.transport.armed.has(i));
+    refreshTransport();
+    renderLanes();
   };
-  head.appendChild(srcSel);
+  const monBtn = el('button', 'mon-btn', 'MON');
+  monBtn.title = 'input monitoring (mic through this strip)';
+  monBtn.onclick = async () => {
+    if (monState[i]) {
+      monState[i] = false;
+      engine.setMonitor(i, false);
+      monBtn.classList.remove('active');
+      return;
+    }
+    await engine.ensureCtx();
+    const mic = await engine.ensureMic();
+    if (!mic) {
+      toast('mic unavailable — monitoring off');
+      return;
+    }
+    monState[i] = true;
+    engine.setMonitor(i, true);
+    monBtn.classList.add('active');
+  };
+  const inSel = el('select', 'src-sel');
+  for (const [v, l] of [['mic', 'Mic'], ['file', 'File']]) {
+    const o = el('option', '', l);
+    o.value = v;
+    inSel.appendChild(o);
+  }
+  inSel.value = tp.input;
+  inSel.title = 'record input for this track';
+  inSel.onchange = () => { tp.input = inSel.value; autosave(); };
+  head.append(armBtn, monBtn, inSel);
   strip.appendChild(head);
+  refs.armBtn = armBtn; refs.monBtn = monBtn; refs.inSel = inSel;
 
-  const noteRow = el('div', 'note-row');
-  const noteSel = el('select', 'note-sel');
-  for (let m = 24; m <= 96; m++) {
-    const o = el('option', '', midiToName(m));
-    o.value = m;
-    noteSel.appendChild(o);
-  }
-  noteSel.value = p.note;
-  noteSel.style.display = MELODIC.has(p.source) ? '' : 'none';
-  noteSel.onchange = () => { p.note = +noteSel.value; autosave(); };
-  const loadSampleBtn = el('button', 'sample-btn', 'LOAD SMPL');
-  loadSampleBtn.style.display = p.source === 'sample' ? '' : 'none';
-  const fileIn = el('input');
-  fileIn.type = 'file'; fileIn.accept = 'audio/*'; fileIn.style.display = 'none';
-  fileIn.onchange = async () => {
-    if (!fileIn.files[0]) return;
-    await ensureCtx();
-    const dur = await engine.loadSample(i, fileIn.files[0]);
-    loadSampleBtn.textContent = 'SMPL ✓ ' + dur.toFixed(1) + 's';
-    fileIn.value = '';
-  };
-  loadSampleBtn.onclick = () => fileIn.click();
-  noteRow.append(noteSel, loadSampleBtn, fileIn);
-  strip.appendChild(noteRow);
-
-  // drop zone for samples
+  // drop zone for audio files -> clip at the drop time
   strip.addEventListener('dragover', (e) => { e.preventDefault(); strip.classList.add('drop'); });
   strip.addEventListener('dragleave', () => strip.classList.remove('drop'));
   strip.addEventListener('drop', async (e) => {
     e.preventDefault(); strip.classList.remove('drop');
     const f = e.dataTransfer.files[0];
     if (!f) return;
-    await ensureCtx();
-    await engine.loadSample(i, f);
-    p.source = 'sample'; srcSel.value = 'sample';
-    noteSel.style.display = 'none'; loadSampleBtn.style.display = '';
-    loadSampleBtn.textContent = 'SMPL ✓';
-    renderRowLabel(i);
-    autosave();
+    try {
+      await engine.importFile(i, f, engine.transport.position);
+      renderLanes(); autosave();
+      toast('imported ' + f.name);
+    } catch {
+      toast('could not decode ' + f.name);
+    }
   });
 
   // EQ
@@ -410,7 +444,6 @@ function buildStrip(i) {
   refs.knobs.comp_ratio = ck('RATIO', 'ratio', 1, 20, 'log', (v) => v.toFixed(1) + ':1');
   refs.knobs.comp_knee = ck('KNEE', 'knee', 0, 30, 'lin', (v) => v.toFixed(0) + 'dB');
   refs.knobs.comp_makeup = ck('MAKEUP', 'makeup', 0, 24, 'lin', (v) => '+' + v.toFixed(1) + 'dB');
-  // attack/release knobs work in ms; the engine stores seconds
   refs.knobs.comp_atk = makeKnob(compKnobs, {
     label: 'ATK', min: 0.1, max: 100, value: p.comp.attack * 1000, scale: 'log',
     format: (v) => v.toFixed(1) + 'ms', accent: '#c9a0dc',
@@ -476,12 +509,10 @@ function buildStrip(i) {
   strip.appendChild(fadRow);
 
   refs.polBtn = polBtn; refs.muteBtn = muteBtn; refs.soloBtn = soloBtn;
-  refs.srcSel = srcSel; refs.noteSel = noteSel; refs.loadSampleBtn = loadSampleBtn;
   refs.applyState = () => {
-    srcSel.value = p.source;
-    noteSel.value = p.note;
-    noteSel.style.display = MELODIC.has(p.source) ? '' : 'none';
-    loadSampleBtn.style.display = p.source === 'sample' ? '' : 'none';
+    const tp2 = project.tracks[i];
+    inSel.value = tp2.input;
+    armBtn.classList.toggle('armed', engine.transport.armed.has(i));
     eqInBtn.classList.toggle('active', p.eq.in);
     polBtn.classList.toggle('active', p.invert);
     muteBtn.classList.toggle('active', p.mute);
@@ -501,7 +532,7 @@ function buildStrip(i) {
   return strip;
 }
 
-// ---------------- master strip ----------------
+// ---------------- master strip (unchanged) ----------------
 let masterRefs = {};
 function buildMaster() {
   const p = project.master;
@@ -558,122 +589,188 @@ function buildMaster() {
   return m;
 }
 
-// ---------------- sequencer grid ----------------
-let gridBtns = [];
-function buildSequencer() {
-  const wrap = $('#seq');
+// ---------------- tape timeline ----------------
+const PXSEC = 60; // timeline pixels per second
+let laneCanvases = [];
+
+function xToTime(cv, e) {
+  const r = cv.getBoundingClientRect();
+  return Math.max(0, (e.clientX - r.left) / PXSEC);
+}
+
+function buildTape() {
+  const wrap = $('#tape');
   wrap.innerHTML = '';
-  wrap.appendChild(el('div', 'seq-title', 'STEP SEQUENCER'));
-  const grid = el('div', 'seq-grid');
-  gridBtns = [];
-  for (let ch = 0; ch < CHANNELS; ch++) {
-    const label = el('div', 'seq-row-label', '');
-    label.id = 'rowlabel-' + ch;
-    grid.appendChild(label);
-    const row = [];
-    for (let s = 0; s < STEPS; s++) {
-      const b = el('button', 'step' + (s % 4 === 0 ? ' beat' : ''));
-      b.dataset.ch = ch; b.dataset.step = s;
-      b.onclick = (e) => {
-        const v = toggleStep(project.patterns[project.currentPattern], ch, s);
-        paintStep(b, v);
-        autosave();
-        void e;
-      };
-      b.oncontextmenu = (e) => {
-        e.preventDefault();
-        const pat = project.patterns[project.currentPattern];
-        pat[ch][s] = pat[ch][s] === 2 ? 0 : 2;
-        paintStep(b, pat[ch][s]);
-        autosave();
-      };
-      grid.appendChild(b);
-      row.push(b);
+  const head = el('div', 'tape-head');
+  head.appendChild(el('div', 'seq-title', 'TAPE — 8 TRACK'));
+  head.appendChild(el('div', 'tape-note',
+    'click a lane to move the playhead · drop audio onto a lane to place a clip · autosave keeps settings + clip layout only (no audio — use SAVE)'));
+  wrap.appendChild(head);
+  const scroll = el('div', 'lanes-scroll');
+  const inner = el('div', 'lanes-inner');
+  inner.id = 'lanes-inner';
+  laneCanvases = [];
+  for (let i = 0; i < TRACKS; i++) {
+    const lane = el('div', 'lane');
+    const lab = el('div', 'lane-label', 'TRK ' + (i + 1));
+    lab.id = 'lanelabel-' + i;
+    const cv = el('canvas', 'lane-cv');
+    cv.height = 54;
+    cv.addEventListener('click', (e) => { engine.seek(xToTime(cv, e)); });
+    cv.addEventListener('dragover', (e) => { e.preventDefault(); cv.classList.add('drop'); });
+    cv.addEventListener('dragleave', () => cv.classList.remove('drop'));
+    cv.addEventListener('drop', async (e) => {
+      e.preventDefault(); cv.classList.remove('drop');
+      const f = e.dataTransfer.files[0];
+      if (!f) return;
+      try {
+        await engine.importFile(i, f, xToTime(cv, e));
+        renderLanes(); autosave();
+        toast('imported ' + f.name);
+      } catch {
+        toast('could not decode ' + f.name);
+      }
+    });
+    lane.append(lab, cv);
+    inner.appendChild(lane);
+    laneCanvases.push(cv);
+  }
+  const ph = el('div', 'playhead');
+  ph.id = 'playhead';
+  inner.appendChild(ph);
+  scroll.appendChild(inner);
+  wrap.appendChild(scroll);
+  renderLanes();
+}
+
+function drawWave(g, pcm, x, w, h) {
+  const d = pcm.data, ch = pcm.channels;
+  const frames = Math.floor(d.length / ch);
+  if (frames < 1 || w < 1) return;
+  g.fillStyle = '#7fd4a8';
+  const mid = h / 2;
+  for (let px = 0; px < w; px++) {
+    const f0 = Math.floor((px / w) * frames);
+    const f1 = Math.max(f0 + 1, Math.floor(((px + 1) / w) * frames));
+    let mn = 1, mx = -1;
+    const stride = Math.max(1, Math.floor((f1 - f0) / 24));
+    for (let f = f0; f < f1 && f < frames; f += stride) {
+      const v = d[f * ch];
+      if (v < mn) mn = v;
+      if (v > mx) mx = v;
     }
-    gridBtns.push(row);
-  }
-  wrap.appendChild(grid);
-  const hint = el('div', 'seq-hint', 'click: toggle step · right-click: accent · space: play/stop');
-  wrap.appendChild(hint);
-  renderGrid();
-}
-
-function paintStep(b, v) {
-  b.classList.toggle('on', v === 1);
-  b.classList.toggle('accent', v === 2);
-}
-
-function renderGrid() {
-  const pat = project.patterns[project.currentPattern];
-  for (let ch = 0; ch < CHANNELS; ch++)
-    for (let s = 0; s < STEPS; s++) paintStep(gridBtns[ch][s], pat[ch][s]);
-  renderRowLabels();
-}
-
-function renderRowLabel(i) {
-  const lab = $('#rowlabel-' + i);
-  if (lab) lab.textContent = `${i + 1} ${SOURCE_LABELS[project.channels[i].source] || ''}`;
-}
-function renderRowLabels() {
-  for (let i = 0; i < CHANNELS; i++) renderRowLabel(i);
-}
-
-// ---------------- transport ----------------
-async function ensureCtx() {
-  if (!engine.ctx) {
-    await engine.init();
-    engine.wireBus();
-    applyAll();
-  }
-  if (engine.ctx.state === 'suspended') await engine.ctx.resume();
-}
-
-async function togglePlay() {
-  await ensureCtx();
-  const btn = $('#play-btn');
-  if (engine.playing) {
-    engine.stop();
-    btn.textContent = '▶ PLAY';
-    btn.classList.remove('playing');
-    clearPlayhead();
-  } else {
-    engine.play();
-    btn.textContent = '⏹ STOP';
-    btn.classList.add('playing');
+    const y1 = mid - mx * (mid - 2), y2 = mid - mn * (mid - 2);
+    g.fillRect(x + px, y1, 1, Math.max(1, y2 - y1));
   }
 }
 
-function clearPlayhead() {
-  for (const row of gridBtns) for (const b of row) b.classList.remove('play');
-  $('#now-playing').textContent = '';
+function renderLanes() {
+  const width = Math.max(1200, Math.ceil((mixEnd(project) + 5) * PXSEC));
+  for (let i = 0; i < TRACKS; i++) {
+    const cv = laneCanvases[i];
+    cv.width = width;
+    const g = cv.getContext('2d');
+    const H = cv.height;
+    g.clearRect(0, 0, width, H);
+    g.fillStyle = '#141416';
+    g.fillRect(0, 0, width, H);
+    // second marks
+    g.fillStyle = '#2c2c31';
+    g.font = '9px sans-serif';
+    for (let s = 0; s * PXSEC < width; s += 5) {
+      g.fillRect(s * PXSEC, 0, 1, 5);
+      g.fillStyle = '#3a3a40';
+      g.fillText(s + 's', s * PXSEC + 3, 10);
+      g.fillStyle = '#2c2c31';
+    }
+    const armed = engine.transport.armed.has(i);
+    for (const clip of project.tracks[i].clips) {
+      const x = clip.startOffset * PXSEC;
+      const w = Math.max(3, clip.duration * PXSEC);
+      g.fillStyle = armed ? 'rgba(224,108,91,.25)' : 'rgba(127,212,168,.16)';
+      g.fillRect(x, 12, w, H - 24);
+      g.strokeStyle = armed ? '#e06c5b' : '#7fd4a8';
+      g.strokeRect(x + 0.5, 12.5, w, H - 24);
+      if (clip.pcm) {
+        drawWave(g, clip.pcm, x + 2, w - 4, H - 28);
+      } else {
+        // audio missing (e.g. restored from autosave): hatch it
+        g.strokeStyle = '#8a8578';
+        g.beginPath();
+        for (let hx = x; hx < x + w; hx += 8) {
+          g.moveTo(hx, H - 12); g.lineTo(hx + 8, 12);
+        }
+        g.stroke();
+        g.fillStyle = '#8a8578';
+        g.font = '9px sans-serif';
+        g.fillText('NO AUDIO', x + 4, H / 2 + 3);
+      }
+      g.fillStyle = '#d8d2c4';
+      g.font = '9px sans-serif';
+      const label = clip.name + ' @' + clip.startOffset.toFixed(1) + 's';
+      g.fillText(label.slice(0, 40), x + 4, 11);
+    }
+    const lab = $('#lanelabel-' + i);
+    if (lab) lab.classList.toggle('armed', armed);
+  }
+  const inner = $('#lanes-inner');
+  if (inner) inner.style.width = width + 64 + 'px';
 }
 
+// ---------------- rebuild ----------------
 function rebuildAll() {
-  // refresh knobs/buttons from a freshly loaded project
-  window._tempoKnob.setValue(project.tempo);
-  window._swingKnob.setValue(project.swing);
-  for (const k of PATTERN_IDS) window._patBtns[k].classList.toggle('active', k === project.currentPattern);
-  window._songToggle.textContent = project.songMode ? 'SONG: ON' : 'SONG: OFF';
-  window._songToggle.classList.toggle('active', project.songMode);
-  renderSong();
-  for (let i = 0; i < CHANNELS; i++) stripRefs[i].applyState();
+  for (let i = 0; i < TRACKS; i++) stripRefs[i].applyState();
   masterRefs.applyState();
-  renderGrid();
+  vsKnob.setValue(rateToVarispeed(project.varispeed || 1));
+  engine.varispeed = project.varispeed || 1;
+  renderLanes();
   applyAll();
 }
 
-// ---------------- meters ----------------
-const peakHold = new Array(CHANNELS).fill(0);
+// ---------------- meters + tape UI loop ----------------
+const peakHold = new Array(TRACKS).fill(0);
 let masterHold = [0, 0];
+
+function drawReel(cv, angle, rec) {
+  const g = cv.getContext('2d');
+  const S = 54, c = S / 2;
+  g.clearRect(0, 0, S, S);
+  g.strokeStyle = rec ? '#e06c5b' : '#8a8578';
+  g.lineWidth = 3;
+  g.beginPath(); g.arc(c, c, 22, 0, Math.PI * 2); g.stroke();
+  g.beginPath(); g.arc(c, c, 6, 0, Math.PI * 2); g.stroke();
+  g.strokeStyle = rec ? '#e06c5b' : '#d8d2c4';
+  g.lineWidth = 4;
+  for (let k = 0; k < 3; k++) {
+    const a = angle + (k * Math.PI * 2) / 3;
+    g.beginPath();
+    g.moveTo(c + Math.cos(a) * 7, c + Math.sin(a) * 7);
+    g.lineTo(c + Math.cos(a) * 20, c + Math.sin(a) * 20);
+    g.stroke();
+  }
+}
 
 function meterLoop() {
   requestAnimationFrame(meterLoop);
+  const now = performance.now();
+  const dt = lastFrameT ? (now - lastFrameT) / 1000 : 0;
+  lastFrameT = now;
   if (!engine.ctx) return;
-  for (let i = 0; i < CHANNELS; i++) {
+  const st = engine.transport.state;
+  const rolling = st === ST_PLAYING || st === ST_RECORDING;
+  // tape UI
+  counterEl.textContent = fmtCounter(engine.positionNow());
+  if (rolling) reelAngle += dt * 3.2 * engine.varispeed;
+  drawReel(reelL, reelAngle, st === ST_RECORDING);
+  drawReel(reelR, -reelAngle * 0.92, st === ST_RECORDING);
+  const ph = $('#playhead');
+  if (ph) ph.style.left = 64 + engine.positionNow() * PXSEC + 'px';
+  // meters
+  for (let i = 0; i < TRACKS; i++) {
     const pk = engine.channelPeak(i);
     peakHold[i] = Math.max(pk, peakHold[i] * 0.985);
     drawVertMeter(stripRefs[i].meterCv, pk, peakHold[i]);
-    const gr = Math.min(24, -(engine.channelGR(i) || 0)); // 0..24 dB
+    const gr = Math.min(24, -(engine.channelGR(i) || 0));
     drawGR(stripRefs[i].grCv, gr / 24);
   }
   const [l, r] = engine.masterPeaks();
@@ -729,33 +826,32 @@ function drawStereoMeter(cv, l, r, hl, hr) {
 function boot() {
   buildTopbar();
   const strips = $('#strips');
-  for (let i = 0; i < CHANNELS; i++) strips.appendChild(buildStrip(i));
+  for (let i = 0; i < TRACKS; i++) strips.appendChild(buildStrip(i));
   $('#master-wrap').appendChild(buildMaster());
-  buildSequencer();
-  const np = el('div', 'now-playing');
-  np.id = 'now-playing';
-  $('#seq').appendChild(np);
-
-  engine.onStep = (step, pid) => {
-    clearPlayhead();
-    if (step < 0) return;
-    for (const row of gridBtns) row[step].classList.add('play');
-    // in song mode the grid shows the current pattern; switch view to follow
-    if (project.songMode && pid !== project.currentPattern) selectPattern(pid);
-    $('#now-playing').textContent = project.songMode ? `playing pattern ${pid}` : '';
-  };
+  buildTape();
+  refreshTransport();
 
   document.addEventListener('keydown', (e) => {
     if (e.code === 'Space' && !/INPUT|SELECT|TEXTAREA|BUTTON/.test(document.activeElement?.tagName || '')) {
       e.preventDefault();
-      togglePlay();
+      togglePlayStop();
     }
   });
 
   requestAnimationFrame(meterLoop);
 }
 
+async function togglePlayStop() {
+  const st = engine.transport.state;
+  if (st === ST_STOPPED) await onPlay();
+  else await onStop();
+}
+
 document.addEventListener('DOMContentLoaded', boot);
 
 // debug / scripting handle (also used by automated verification)
-window.__console8 = { engine, get project() { return project; } };
+window.__console8 = {
+  engine,
+  get project() { return project; },
+  get transport() { return engine.transport; },
+};

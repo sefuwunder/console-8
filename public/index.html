@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Console-8 — 8-channel DAW</title>
+<title>Console-8 — 8-track tape</title>
 <style>
   :root {
     --bg: #101012; --panel: #18181b; --strip: #1e1e22; --line: #2c2c31;
@@ -27,30 +27,34 @@
     text-shadow: 0 0 12px rgba(224,120,64,.35);
   }
   .transport { display: flex; gap: 8px; align-items: center; }
-  .play-btn {
-    font-size: 15px; font-weight: 700; padding: 10px 22px; cursor: pointer;
-    background: #2a2a2e; color: var(--green); border: 1px solid var(--line); border-radius: 6px;
+  .tbtn {
+    font-size: 13px; font-weight: 700; padding: 10px 16px; cursor: pointer;
+    background: #2a2a2e; color: var(--txt); border: 1px solid var(--line); border-radius: 6px;
+    letter-spacing: 1px;
   }
-  .play-btn.playing { color: var(--red); border-color: var(--red); }
+  .tbtn.rec.armed { color: var(--red); border-color: var(--red); }
+  .tbtn.rec.recording { background: var(--red); color: #141414; animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: 0.55; } }
+  .tbtn.play.playing { color: var(--green); border-color: var(--green); }
+  .counter {
+    font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums;
+    color: var(--amber); background: #0c0c0e; border: 1px solid var(--line);
+    border-radius: 6px; padding: 4px 14px; letter-spacing: 2px;
+    text-shadow: 0 0 10px rgba(224,164,88,.4); min-width: 110px; text-align: center;
+  }
+  .reels { display: flex; gap: 6px; }
+  .reel { background: #0c0c0e; border: 1px solid var(--line); border-radius: 6px; }
+  .mic-ok { color: var(--green); font-size: 11px; letter-spacing: 1px; }
+  .mic-error { color: var(--red); font-size: 11px; letter-spacing: 1px; }
+  .mic-unknown { color: var(--dim); font-size: 11px; letter-spacing: 1px; }
   .top-group { display: flex; align-items: center; gap: 8px; }
   .top-label { color: var(--dim); font-size: 10px; letter-spacing: 2px; }
-  .pat-btns { display: flex; gap: 4px; }
-  .pat-btn, .song-toggle, .file-btn, .song-add-btn {
+  .file-btn, .bounce {
     background: #2a2a2e; color: var(--txt); border: 1px solid var(--line);
     border-radius: 4px; padding: 6px 10px; cursor: pointer; font-size: 12px;
   }
-  .pat-btn.active, .song-toggle.active { background: var(--amber); color: #141414; font-weight: 700; }
-  .song-row { display: flex; gap: 8px; align-items: center; }
-  .song-chips { display: flex; gap: 3px; min-width: 90px; flex-wrap: wrap; }
-  .song-chip {
-    background: #33333a; border: 1px solid var(--line); border-radius: 3px;
-    padding: 3px 7px; font-weight: 700; color: var(--amber);
-  }
-  .song-empty { color: var(--dim); font-size: 11px; }
-  .song-add { display: flex; gap: 3px; }
-  .song-add-btn { padding: 4px 7px; font-size: 11px; }
-  .save-state { color: var(--dim); font-size: 11px; min-width: 120px; }
-  #now-playing { color: var(--amber); font-size: 11px; padding: 2px 14px; min-height: 16px; }
+  .bounce { color: var(--tube); border-color: var(--tube); font-weight: 700; }
+  .save-state { color: var(--dim); font-size: 11px; min-width: 220px; }
 
   #console { display: flex; gap: 6px; padding: 10px 14px; align-items: stretch; overflow-x: auto; }
   #strips { display: flex; gap: 6px; }
@@ -60,19 +64,26 @@
   }
   .strip.drop { border-color: var(--amber); box-shadow: 0 0 10px rgba(224,164,88,.4); }
   #master-wrap .strip { width: 150px; background: #232027; border-color: #3a3230; }
-  .strip-head { display: flex; align-items: center; gap: 6px; }
+  .strip-head { display: flex; align-items: center; gap: 4px; }
   .ch-num {
     font-weight: 800; font-size: 15px; color: var(--dim);
     background: #141416; border-radius: 4px; padding: 2px 7px;
   }
-  .src-sel, .note-sel {
+  .arm-btn {
+    background: #2a2a2e; color: var(--dim); border: 1px solid var(--line);
+    border-radius: 4px; padding: 5px 7px; cursor: pointer; font-size: 10px; font-weight: 700;
+    letter-spacing: 1px;
+  }
+  .arm-btn.armed { background: var(--red); color: #141414; border-color: var(--red); }
+  .mon-btn {
+    background: #2a2a2e; color: var(--dim); border: 1px solid var(--line);
+    border-radius: 4px; padding: 5px 7px; cursor: pointer; font-size: 10px; font-weight: 700;
+    letter-spacing: 1px;
+  }
+  .mon-btn.active { background: var(--blue); color: #141414; border-color: var(--blue); }
+  .src-sel {
     flex: 1; background: #141416; color: var(--txt); border: 1px solid var(--line);
     border-radius: 4px; padding: 4px; font-size: 11px; min-width: 0;
-  }
-  .note-row { display: flex; gap: 4px; }
-  .sample-btn {
-    flex: 1; background: #2a2a2e; color: var(--amber); border: 1px dashed var(--amber);
-    border-radius: 4px; font-size: 10px; padding: 5px; cursor: pointer;
   }
   .sec-title {
     display: flex; justify-content: space-between; align-items: center;
@@ -129,31 +140,34 @@
     background: #d8d2c4; border-radius: 2px; box-shadow: 0 1px 3px #000;
   }
 
-  #seq { padding: 4px 14px 18px; }
-  .seq-title { color: var(--dim); font-size: 10px; letter-spacing: 2px; margin-bottom: 6px; }
-  .seq-grid {
-    display: grid; grid-template-columns: 86px repeat(16, 30px); gap: 3px; align-items: center;
+  #tape { padding: 4px 14px 18px; }
+  .tape-head { display: flex; align-items: baseline; gap: 14px; margin-bottom: 6px; }
+  .seq-title { color: var(--dim); font-size: 10px; letter-spacing: 2px; }
+  .tape-note { color: var(--dim); font-size: 11px; }
+  .lanes-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; background: #101012; }
+  .lanes-inner { position: relative; padding: 6px 0; }
+  .lane { display: flex; align-items: center; gap: 0; height: 58px; border-bottom: 1px solid #1c1c20; }
+  .lane:last-child { border-bottom: none; }
+  .lane-label {
+    flex: 0 0 64px; color: var(--dim); font-size: 10px; font-weight: 700; letter-spacing: 1px;
+    text-align: right; padding-right: 8px;
   }
-  .seq-row-label { color: var(--dim); font-size: 10px; text-align: right; padding-right: 6px; white-space: nowrap; }
-  .step {
-    width: 30px; height: 26px; background: #1c1c20; border: 1px solid var(--line);
-    border-radius: 3px; cursor: pointer; padding: 0;
+  .lane-label.armed { color: var(--red); }
+  .lane-cv { display: block; cursor: text; border-radius: 4px; }
+  .lane-cv.drop { outline: 2px dashed var(--amber); }
+  .playhead {
+    position: absolute; top: 0; bottom: 0; width: 2px; background: var(--amber);
+    box-shadow: 0 0 6px rgba(224,164,88,.8); pointer-events: none; left: 64px;
   }
-  .step.beat { border-color: #3d3d45; }
-  .step.on { background: var(--amber); }
-  .step.accent { background: var(--red); box-shadow: 0 0 6px rgba(224,108,91,.6); }
-  .step.play { outline: 2px solid #f2ede4; outline-offset: -1px; }
-  .seq-hint { color: var(--dim); font-size: 11px; margin-top: 6px; }
 </style>
 </head>
 <body>
   <div id="topbar"></div>
-  <div id="now-playing"></div>
   <div id="console">
     <div id="strips"></div>
     <div id="master-wrap"></div>
   </div>
-  <div id="seq"></div>
+  <div id="tape"></div>
   <script type="module" src="./public/app.js"></script>
 </body>
 </html>

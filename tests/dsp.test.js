@@ -1,8 +1,8 @@
 import { describe, test, expect } from 'bun:test';
 import {
   dbToGain, gainToDb, tubeCurve, knobToLog, knobToLin, logToKnob,
-  faderToGain, panToGains, midiToFreq, midiToName, eqDefaults, compDefaults,
-  limiterDefaults, channelDefaults, masterDefaults, SOURCES,
+  faderToGain, panToGains, eqDefaults, compDefaults,
+  limiterDefaults, channelDefaults, masterDefaults,
 } from '../src/dsp.js';
 
 describe('db/gain', () => {
@@ -102,20 +102,6 @@ describe('fader and pan', () => {
   });
 });
 
-describe('pitch helpers', () => {
-  test('A4 is 440 Hz', () => {
-    expect(midiToFreq(69)).toBeCloseTo(440, 6);
-  });
-  test('octave doubles', () => {
-    expect(midiToFreq(81) / midiToFreq(69)).toBeCloseTo(2, 8);
-  });
-  test('note names', () => {
-    expect(midiToName(60)).toBe('C4');
-    expect(midiToName(69)).toBe('A4');
-    expect(midiToName(36)).toBe('C2');
-  });
-});
-
 describe('defaults', () => {
   test('EQ has 4 SSL-style bands', () => {
     const eq = eqDefaults();
@@ -125,11 +111,12 @@ describe('defaults', () => {
     expect(eq.lmf.type).toBe('peaking');
     expect(eq.hmf.q).toBeGreaterThan(0);
   });
-  test('channel defaults cover 8 sources', () => {
-    expect(SOURCES.length).toBe(9);
+  test('channel defaults are strip-only (no sources)', () => {
     for (let i = 0; i < 8; i++) {
-      const c = channelDefaults(i);
-      expect(SOURCES).toContain(c.source);
+      const c = channelDefaults();
+      expect(c.source).toBeUndefined();
+      expect(c.note).toBeUndefined();
+      expect(c.eq.hf.type).toBe('highshelf');
       expect(c.fader).toBeGreaterThan(0);
     }
   });
